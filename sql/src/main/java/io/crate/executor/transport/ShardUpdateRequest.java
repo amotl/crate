@@ -21,62 +21,182 @@
 
 package io.crate.executor.transport;
 
+import com.google.common.collect.Iterators;
 import io.crate.Constants;
+import io.crate.Streamer;
 import io.crate.planner.symbol.Reference;
 import io.crate.planner.symbol.Symbol;
-import org.elasticsearch.action.DocumentRequest;
 import org.elasticsearch.action.support.single.instance.InstanceShardOperationRequest;
 import org.elasticsearch.common.Nullable;
 import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
+import org.elasticsearch.common.io.stream.Streamable;
 import org.elasticsearch.common.lucene.uid.Versions;
-import org.elasticsearch.index.mapper.Uid;
 import org.elasticsearch.index.shard.ShardId;
 
 import java.io.IOException;
-import java.util.HashMap;
-import java.util.Map;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
 
-public class ShardUpdateRequest extends InstanceShardOperationRequest<ShardUpdateRequest> implements DocumentRequest<ShardUpdateRequest> {
+public class ShardUpdateRequest extends InstanceShardOperationRequest<ShardUpdateRequest> implements Iterable<ShardUpdateRequest.Item> {
 
-    private String id;
+    /**
+     * A single update item.
+     */
+    public static class Item implements Streamable {
+
+        private String id;
+        private Symbol[] assignments;
+        private long version = Versions.MATCH_ANY;
+        @Nullable
+        private Object[] missingAssignments;
+        @Nullable
+        private Streamer[] streamers;
+
+
+        Item(@Nullable Streamer[] streamers) {
+            this.streamers = streamers;
+        }
+
+        Item(String id,
+             Symbol[] assignments,
+             @Nullable Long version,
+             @Nullable Object[] missingAssignments,
+             @Nullable Streamer[] streamers) {
+            this(streamers);
+            this.id = id;
+            this.assignments = assignments;
+            if (version != null) {
+                this.version = version;
+            }
+            this.missingAssignments = missingAssignments;
+        }
+
+        public String id() {
+            return id;
+        }
+
+        public long version() {
+            return version;
+        }
+
+        public int retryOnConflict() {
+            return version == Versions.MATCH_ANY ? Constants.UPDATE_RETRY_ON_CONFLICT : 0;
+        }
+
+        public Symbol[] assignments() {
+            return assignments;
+        }
+
+        @Nullable
+        public Object[] missingAssignments() {
+            return missingAssignments;
+        }
+
+        static Item readItem(StreamInput in, @Nullable Streamer[] streamers) throws IOException {
+            Item item = new Item(streamers);
+            item.readFrom(in);
+            return item;
+        }
+
+        @Override
+        public void readFrom(StreamInput in) throws IOException {
+            id = in.readString();
+            int mapSize = in.readVInt();
+            assignments = new Symbol[mapSize];
+            for (int i = 0; i < mapSize; i++) {
+                assignments[i] = Symbol.fromStream(in);
+            }
+            int missingAssignmentsSize = in.readVInt();
+            if (missingAssignmentsSize > 0) {
+                this.missingAssignments = new Object[missingAssignmentsSize];
+                for (int i = 0; i < missingAssignmentsSize; i++) {
+                    missingAssignments[i] = streamers[i].readValueFrom(in);
+                }
+            }
+
+            version = Versions.readVersion(in);
+        }
+
+        @Override
+        public void writeTo(StreamOutput out) throws IOException {
+            out.writeString(id);
+            out.writeVInt(assignments.length);
+            for (int i = 0; i < assignments.length; i++) {
+                Symbol.toStream(assignments[i], out);
+            }
+            // Stream References
+            if (missingAssignments != null) {
+                out.writeVInt(missingAssignments.length);
+                for (int i = 0; i < missingAssignments.length; i++) {
+                    streamers[i].writeValueTo(out, missingAssignments[i]);
+                }
+            } else {
+                out.writeVInt(0);
+            }
+
+            Versions.writeVersion(version, out);
+        }
+    }
+
+    private List<Item> items;
+    private Reference[] assignmentsColumns;
     @Nullable
     private String routing;
-    private long version = Versions.MATCH_ANY;
-    private Map<String, Symbol> assignments;
-
     @Nullable
     private Reference[] missingAssignmentsColumns;
     @Nullable
-    private Object[] missingAssignments;
+    private Streamer[] streamers;
 
     public ShardUpdateRequest() {
     }
 
-    public ShardUpdateRequest(String index, String id) {
+    public ShardUpdateRequest(String index,
+                              Reference[] assignmentsColumns,
+                              @Nullable Reference[] missingAssignmentsColumns) {
         super(index);
-        this.id = id;
-    }
-
-    public ShardUpdateRequest(ShardId shardId, Uid uid, @Nullable Long version) {
-        this(shardId.getIndex(), uid.id());
-        this.shardId = shardId.id();
-        if (version != null) {
-            version(version);
+        this.assignmentsColumns = assignmentsColumns;
+        this.missingAssignmentsColumns = missingAssignmentsColumns;
+        items = new ArrayList<>();
+        if (missingAssignmentsColumns != null) {
+            streamers = new Streamer[missingAssignmentsColumns.length];
+            for (int i = 0; i < missingAssignmentsColumns.length; i++) {
+                streamers[i] = missingAssignmentsColumns[i].valueType().streamer();
+            }
         }
     }
 
-    @Override
+    public ShardUpdateRequest(ShardId shardId,
+                              Reference[] assignmentsColumns,
+                              @Nullable Reference[] missingAssignmentsColumns) {
+        this(shardId.getIndex(), assignmentsColumns, missingAssignmentsColumns);
+        this.shardId = shardId.id();
+    }
+
+    public List<Item> items() {
+        return this.items;
+    }
+
+    public ShardUpdateRequest add(String id,
+                                  Symbol[] assignments,
+                                  @Nullable Long version) {
+        items.add(new Item(id, assignments, version, null, null));
+        return this;
+    }
+
+    public ShardUpdateRequest add(String id,
+                                  Symbol[] assignments,
+                                  @Nullable Long version,
+                                  @Nullable Object[] missingAssignments) {
+        items.add(new Item(id, assignments, version, missingAssignments, streamers));
+        return this;
+    }
+
     public String type() {
         return Constants.DEFAULT_MAPPING_TYPE;
     }
 
-    @Override
-    public String id() {
-        return id;
-    }
-
-    @Override
     public ShardUpdateRequest routing(@Nullable String routing) {
         if (routing != null && routing.length() == 0) {
             this.routing = null;
@@ -86,19 +206,9 @@ public class ShardUpdateRequest extends InstanceShardOperationRequest<ShardUpdat
         return this;
     }
 
-    @Override
     @Nullable
     public String routing() {
         return routing;
-    }
-
-    public ShardUpdateRequest version(long version) {
-        this.version = version;
-        return this;
-    }
-
-    public long version() {
-        return version;
     }
 
     public ShardUpdateRequest shardId(int shardId) {
@@ -110,73 +220,59 @@ public class ShardUpdateRequest extends InstanceShardOperationRequest<ShardUpdat
         return shardId;
     }
 
-    public int retryOnConflict() {
-        return version == Versions.MATCH_ANY ? Constants.UPDATE_RETRY_ON_CONFLICT : 0;
-    }
-
-    public ShardUpdateRequest assignments(Map<String, Symbol> assignments) {
-        this.assignments = assignments;
-        return this;
-    }
-
-    public Map<String, Symbol> assignments() {
-        return assignments;
+    public Reference[] assignmentsColumns() {
+        return assignmentsColumns;
     }
 
     @Nullable
-    public Object[] missingAssignments() {
-        return missingAssignments;
-    }
-
-    public void missingAssignments(@Nullable Object[] missingAssignments) {
-        this.missingAssignments = missingAssignments;
-    }
-
     public Reference[] missingAssignmentsColumns() {
         return missingAssignmentsColumns;
     }
 
-    public void missingAssignmentsColumns(Reference[] missingAssignmentsColumns) {
-        this.missingAssignmentsColumns = missingAssignmentsColumns;
+    @Override
+    public Iterator<Item> iterator() {
+        return Iterators.unmodifiableIterator(items.iterator());
     }
 
     @Override
     public void readFrom(StreamInput in) throws IOException {
         super.readFrom(in);
-        id = in.readString();
-        routing = in.readOptionalString();
-        version = Versions.readVersion(in);
-        int mapSize = in.readVInt();
-        assignments = new HashMap<>(mapSize);
-        for (int i = 0; i < mapSize; i++) {
-            assignments.put(in.readString(), Symbol.fromStream(in));
+        int assignmentsColumnsSize = in.readVInt();
+        if (assignmentsColumnsSize > 0) {
+            assignmentsColumns = new Reference[assignmentsColumnsSize];
+            for (int i = 0; i < assignmentsColumnsSize; i++) {
+                assignmentsColumns[i] = Reference.fromStream(in);
+            }
         }
         int missingAssignmentsColumnsSize = in.readVInt();
-        missingAssignmentsColumns = new Reference[missingAssignmentsColumnsSize];
-        for (int i = 0; i < missingAssignmentsColumnsSize; i++) {
-            missingAssignmentsColumns[i] = (Reference)Reference.fromStream(in);
+        if (missingAssignmentsColumnsSize > 0) {
+            missingAssignmentsColumns = new Reference[missingAssignmentsColumnsSize];
+            streamers = new Streamer[missingAssignmentsColumnsSize];
+            for (int i = 0; i < missingAssignmentsColumnsSize; i++) {
+                missingAssignmentsColumns[i] = Reference.fromStream(in);
+                streamers[i] = missingAssignmentsColumns[i].valueType().streamer();
+            }
         }
-
-        int missingAssignmentsSize = in.readVInt();
-        this.missingAssignments = new Object[missingAssignmentsSize];
-        for (int i = 0; i < missingAssignmentsSize; i++) {
-            Reference ref = missingAssignmentsColumns[i];
-            missingAssignments[i] = ref.valueType().streamer().readValueFrom(in);
+        int size = in.readVInt();
+        items = new ArrayList<>(size);
+        for (int i = 0; i < size; i++) {
+            items.add(Item.readItem(in, streamers));
         }
+        routing = in.readOptionalString();
     }
 
     @Override
     public void writeTo(StreamOutput out) throws IOException {
         super.writeTo(out);
-        out.writeString(id);
-        out.writeOptionalString(routing);
-        Versions.writeVersion(version, out);
-        out.writeVInt(assignments.size());
-        for (Map.Entry<String, Symbol> entry : assignments.entrySet()) {
-            out.writeString(entry.getKey());
-            Symbol.toStream(entry.getValue(), out);
-        }
         // Stream References
+        if (assignmentsColumns != null) {
+            out.writeVInt(assignmentsColumns.length);
+            for(Reference reference : assignmentsColumns) {
+                Reference.toStream(reference, out);
+            }
+        } else {
+            out.writeVInt(0);
+        }
         if (missingAssignmentsColumns != null) {
             out.writeVInt(missingAssignmentsColumns.length);
             for(Reference reference : missingAssignmentsColumns) {
@@ -185,15 +281,11 @@ public class ShardUpdateRequest extends InstanceShardOperationRequest<ShardUpdat
         } else {
             out.writeVInt(0);
         }
-        if (missingAssignments != null) {
-            out.writeVInt(missingAssignments.length);
-            for (int i = 0; i < missingAssignments.length; i++) {
-                Reference reference = missingAssignmentsColumns[i];
-                reference.valueType().streamer().writeValueTo(out, missingAssignments[i]);
-            }
-        } else {
-            out.writeVInt(0);
+        out.writeVInt(items().size());
+        for (int i = 0; i < items.size(); i++) {
+            items.get(i).writeTo(out);
         }
+        out.writeOptionalString(routing);
     }
 
 }

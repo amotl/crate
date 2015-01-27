@@ -21,7 +21,6 @@
 
 package io.crate.executor.transport;
 
-import io.crate.Constants;
 import org.elasticsearch.action.ActionResponse;
 import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
@@ -31,73 +30,39 @@ import java.io.IOException;
 public class ShardUpdateResponse extends ActionResponse {
 
     private String index;
-    private String id;
-    private long version;
-    private boolean created;
+    private long affectedRows;
 
     public ShardUpdateResponse() {
-
     }
 
-    public ShardUpdateResponse(String index, String id, long version, boolean created) {
+    public ShardUpdateResponse(String index) {
         this.index = index;
-        this.id = id;
-        this.version = version;
-        this.created = created;
     }
 
-    /**
-     * The index the document was indexed into.
-     */
-    public String getIndex() {
+    public String index() {
         return this.index;
     }
 
-    /**
-     * The type of the document indexed.
-     */
-    public String getType() {
-        return Constants.DEFAULT_MAPPING_TYPE;
+    public long affectedRows() {
+        return affectedRows;
     }
 
-    /**
-     * The id of the document indexed.
-     */
-    public String getId() {
-        return this.id;
-    }
-
-    /**
-     * Returns the current version of the doc indexed.
-     */
-    public long getVersion() {
-        return this.version;
-    }
-
-    /**
-     * Returns true if document was created due to an UPSERT operation
-     */
-    public boolean isCreated() {
-        return this.created;
-
+    public void affectedRows(long affectedRows) {
+        this.affectedRows = affectedRows;
     }
 
     @Override
     public void readFrom(StreamInput in) throws IOException {
         super.readFrom(in);
         index = in.readSharedString();
-        id = in.readString();
-        version = in.readLong();
-        created = in.readBoolean();
+        affectedRows = in.readVLong();
     }
 
     @Override
     public void writeTo(StreamOutput out) throws IOException {
         super.writeTo(out);
         out.writeSharedString(index);
-        out.writeString(id);
-        out.writeLong(version);
-        out.writeBoolean(created);
+        out.writeVLong(affectedRows);
     }
 
 }
